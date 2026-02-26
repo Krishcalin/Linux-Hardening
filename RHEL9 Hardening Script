@@ -1,0 +1,941 @@
+#!/bin/bash
+# =============================================================================
+# RHEL 9 CIS-Benchmark Hardening Script
+# CIS Reference : CIS Red Hat Enterprise Linux 9 Benchmark v2.0.0
+# Tested against: RHEL 9.x / AlmaLinux 9 / Rocky Linux 9
+# =============================================================================
+# USAGE:  sudo bash "RHEL9 Hardening Script"
+# =============================================================================
+
+set -euo pipefail
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+AUDITDIR="/tmp/$(hostname -s)_audit"
+TIME="$(date +%F_%T)"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[*]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+  error "This script must be run as root."
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+. /etc/os-release
+MAIN_VERSION_ID="$(echo "${VERSION_ID}" | cut -f1 -d'.')"
+if [[ "${MAIN_VERSION_ID}" -ne 9 ]]; then
+  error "This script targets RHEL 9.x only. Detected: ${VERSION_ID}"
+  exit 1
+fi
+
+mkdir -p "${AUDITDIR}"
+info "Audit artefacts will be written to: ${AUDITDIR}"
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+# Set key = value in a simple key=value config file (e.g. pwquality.conf)
+_set_kv() {
+  local file="$1" key="$2" value="$3"
+  if grep -qE "^\s*${key}\s*=" "${file}" 2>/dev/null; then
+    sed -i -E "s|^\s*${key}\s*=.*|${key} = ${value}|g" "${file}"
+  else
+    echo "${key} = ${value}" >> "${file}"
+  fi
+}
+
+# Set key=value in an INI-style config file (e.g. journald.conf, coredump.conf)
+_set_ini() {
+  local file="$1" key="$2" value="$3"
+  if grep -qE "^\s*#?\s*${key}\s*=" "${file}" 2>/dev/null; then
+    sed -i -E "s|^\s*#?\s*${key}\s*=.*|${key}=${value}|g" "${file}"
+  else
+    echo "${key}=${value}" >> "${file}"
+  fi
+}
+
+# Set a directive in sshd_config (handles commented and uncommented)
+_set_sshd() {
+  local file="$1" key="$2" value="$3"
+  if grep -qiE "^\s*#?\s*${key}\s+" "${file}" 2>/dev/null; then
+    sed -i -E "s|^\s*#?\s*${key}\s+.*|${key} ${value}|I" "${file}"
+  else
+    echo "${key} ${value}" >> "${file}"
+  fi
+}
+
+# =============================================================================
+# 1. LEGACY FILESYSTEMS & PROTOCOLS  (CIS 1.1.1, 3.4)
+# =============================================================================
+info "Disabling legacy filesystems and network protocols..."
+cat > /etc/modprobe.d/CIS.conf << "EOF"
+# CIS 1.1.1.x – Disable unused/legacy filesystems
+install cramfs   /bin/true
+install freevxfs /bin/true
+install jffs2    /bin/true
+install hfs      /bin/true
+install hfsplus  /bin/true
+install squashfs /bin/true
+install udf      /bin/true
+
+# NOTE: vfat is required on most RHEL 9 systems for the EFI System Partition.
+# Uncomment the line below ONLY if this system has no EFI partition.
+# install vfat /bin/true
+
+# CIS 3.4.x – Disable unused network protocols
+install dccp     /bin/true
+install sctp     /bin/true
+install rds      /bin/true
+install tipc     /bin/true
+
+# CIS 1.1.1.8 – Disable USB storage on high-security systems
+install usb-storage /bin/true
+EOF
+
+# =============================================================================
+# 2. PACKAGE REMOVAL  (CIS 2.x)
+# =============================================================================
+info "Removing packages not required for this server role..."
+
+# CIS 2.2.x – Remove legacy and unneeded server packages
+PKGS_REMOVE=(
+  gcc make autoconf automake
+  rsh-server rsh ypserv tftp tftp-server
+  talk talk-server telnet-server xinetd
+  openldap-servers openldap-clients
+  bind vsftpd dovecot samba squid net-snmp
+  sendmail postfix
+  xorg-x11-server-common
+)
+for pkg in "${PKGS_REMOVE[@]}"; do
+  if rpm -q "${pkg}" &>/dev/null; then
+    dnf -y remove "${pkg}" >> "${AUDITDIR}/pkg_remove_${TIME}.log" 2>&1 \
+      && info "  Removed: ${pkg}" || warn "  Could not remove: ${pkg}"
+  fi
+done
+
+# =============================================================================
+# 3. SECURITY PACKAGE INSTALLATION  (CIS 1.3, 4.1, 4.2)
+# =============================================================================
+info "Installing required security packages..."
+PKGS_INSTALL=(
+  aide            # CIS 1.3.1 – Host-based intrusion detection
+  fapolicyd       # CIS 1.7   – Application allowlisting (new in RHEL 9)
+  usbguard        # CIS 1.1   – USB device policy enforcement
+  dnf-automatic   # CIS 1.9   – Automatic security updates
+  nftables        # CIS 3.5   – Packet filtering
+  audit           # CIS 4.1   – Audit daemon
+  rsyslog         # CIS 4.2   – System logging
+  chrony          # CIS 2.1.2 – NTP
+  libpwquality    # CIS 5.4   – Password quality
+)
+dnf -y install "${PKGS_INSTALL[@]}" \
+  >> "${AUDITDIR}/pkg_install_${TIME}.log" 2>&1 || \
+  warn "Some packages failed to install – check ${AUDITDIR}/pkg_install_${TIME}.log"
+
+# =============================================================================
+# 4. DNF / PACKAGE MANAGER HARDENING  (CIS 1.2)
+# =============================================================================
+info "Hardening DNF package manager configuration..."
+cp /etc/dnf/dnf.conf "${AUDITDIR}/dnf.conf_${TIME}.bak"
+
+_set_ini /etc/dnf/dnf.conf "gpgcheck"                   1
+_set_ini /etc/dnf/dnf.conf "localpkg_gpgcheck"          1
+_set_ini /etc/dnf/dnf.conf "repo_gpgcheck"              0  # per-repo GPG check varies
+_set_ini /etc/dnf/dnf.conf "clean_requirements_on_remove" true
+
+# Ensure all enabled repos have gpgcheck=1
+find /etc/yum.repos.d/ -name '*.repo' -type f | while IFS= read -r repo; do
+  sed -i 's/^gpgcheck\s*=\s*0/gpgcheck=1/' "${repo}"
+done
+
+# =============================================================================
+# 5. AUTOMATIC SECURITY UPDATES  (CIS 1.9)
+# =============================================================================
+info "Configuring dnf-automatic for security-only updates..."
+cp /etc/dnf/automatic.conf "${AUDITDIR}/dnf_automatic.conf_${TIME}.bak" 2>/dev/null || true
+_set_ini /etc/dnf/automatic.conf "upgrade_type"          security
+_set_ini /etc/dnf/automatic.conf "apply_updates"         yes
+_set_ini /etc/dnf/automatic.conf "emit_via"              stdio
+systemctl enable --now dnf-automatic.timer 2>/dev/null || \
+  systemctl enable --now dnf-automatic-install.timer 2>/dev/null || true
+
+# =============================================================================
+# 6. DAEMON UMASK  (CIS 1.5.5)
+# =============================================================================
+info "Setting daemon umask..."
+# /etc/init.d/functions is a legacy SysV remnant; check before touching
+if [[ -f /etc/init.d/functions ]]; then
+  sed -i -E 's/umask [0-9]+/umask 027/g' /etc/init.d/functions
+fi
+
+# =============================================================================
+# 7. UNNECESSARY SERVICES  (CIS 2.1)
+# =============================================================================
+info "Disabling unnecessary services..."
+SERVICES_DISABLE=(
+  dhcpd avahi-daemon cups nfslock rpcgssd rpcbind rpcidmapd rpcsvcgssd
+  bluetooth autofs nfs-server nis kdump
+)
+for svc in "${SERVICES_DISABLE[@]}"; do
+  if systemctl is-enabled "${svc}" &>/dev/null; then
+    systemctl disable --now "${svc}" 2>/dev/null || true
+    info "  Disabled: ${svc}"
+  fi
+done
+
+# =============================================================================
+# 8. NTP / CHRONY  (CIS 2.1.2)
+# =============================================================================
+info "Hardening chrony (NTP) configuration..."
+cp /etc/chrony.conf "${AUDITDIR}/chrony.conf_${TIME}.bak"
+
+# Restrict NTP queries to localhost only
+grep -q "^cmdallow 127.0.0.1" /etc/chrony.conf \
+  || echo "cmdallow 127.0.0.1" >> /etc/chrony.conf
+grep -q "^cmddeny all" /etc/chrony.conf \
+  || echo "cmddeny all" >> /etc/chrony.conf
+
+# Run chrony as non-root chrony user (RHEL 9 default)
+if [[ -f /etc/sysconfig/chronyd ]]; then
+  grep -q '\-u chrony' /etc/sysconfig/chronyd \
+    || sed -i 's/^OPTIONS=.*/OPTIONS="-u chrony"/' /etc/sysconfig/chronyd
+fi
+
+systemctl enable --now chronyd
+
+# =============================================================================
+# 9. PASSWORD QUALITY  (CIS 5.4.1)
+# =============================================================================
+info "Setting password quality policies..."
+# RHEL 9 supports pwquality.conf.d drop-in directory
+mkdir -p /etc/security/pwquality.conf.d
+cat > /etc/security/pwquality.conf.d/CIS.conf << "EOF"
+# CIS RHEL 9 Benchmark v2.0 – Section 5.4.1
+minlen   = 14
+dcredit  = -1
+ucredit  = -1
+ocredit  = -1
+lcredit  = -1
+retry    = 3
+maxrepeat = 3
+difok    = 8
+gecoscheck = 1
+EOF
+
+# =============================================================================
+# 10. FAILLOCK  (CIS 5.4.2)
+# =============================================================================
+info "Configuring pam_faillock..."
+# RHEL 9 uses /etc/security/faillock.conf natively
+cp /etc/security/faillock.conf "${AUDITDIR}/faillock.conf_${TIME}.bak" 2>/dev/null || true
+_set_kv /etc/security/faillock.conf "deny"           5
+_set_kv /etc/security/faillock.conf "unlock_time"    900
+_set_kv /etc/security/faillock.conf "fail_interval"  900
+
+# Apply via authselect
+authselect select sssd --force    >/dev/null 2>&1 || true
+authselect enable-feature with-faillock >/dev/null 2>&1 || true
+authselect apply-changes          >/dev/null 2>&1 || true
+
+# =============================================================================
+# 11. JOURNALD  (CIS 4.2.2)
+# =============================================================================
+info "Configuring systemd-journald..."
+cp /etc/systemd/journald.conf "${AUDITDIR}/journald.conf_${TIME}.bak"
+_set_ini /etc/systemd/journald.conf "Compress"        yes
+_set_ini /etc/systemd/journald.conf "ForwardToSyslog" yes
+_set_ini /etc/systemd/journald.conf "Storage"         persistent
+
+# =============================================================================
+# 12. CORE DUMPS  (CIS 1.5.1)
+# =============================================================================
+info "Restricting core dumps..."
+if grep -qE '^\*\s+hard\s+core' /etc/security/limits.conf 2>/dev/null; then
+  sed -i -E 's/^\*\s+hard\s+core.*/* hard core 0/' /etc/security/limits.conf
+else
+  echo '* hard core 0' >> /etc/security/limits.conf
+fi
+
+if [[ -f /etc/systemd/coredump.conf ]]; then
+  cp /etc/systemd/coredump.conf "${AUDITDIR}/coredump.conf_${TIME}.bak"
+  _set_ini /etc/systemd/coredump.conf "Storage"         none
+  _set_ini /etc/systemd/coredump.conf "ProcessSizeMax"  0
+fi
+
+# =============================================================================
+# 13. RSYSLOG  (CIS 4.2.1)
+# =============================================================================
+info "Configuring rsyslog..."
+cat > /etc/rsyslog.d/CIS.conf << "EOF"
+# CIS RHEL 9 Benchmark v2.0 – Section 4.2.1
+$FileCreateMode 0640
+auth,authpriv.*     /var/log/secure
+kern.*              /var/log/messages
+daemon.*            /var/log/messages
+syslog.*            /var/log/messages
+*.emerg             :omusrmsg:*
+EOF
+chmod 600 /etc/rsyslog.d/CIS.conf
+systemctl enable --now rsyslog
+
+# =============================================================================
+# 14. AUDITD  (CIS 4.1)
+# =============================================================================
+info "Enabling and configuring auditd..."
+systemctl enable --now auditd
+
+cp /etc/audit/auditd.conf "${AUDITDIR}/auditd.conf_${TIME}.bak"
+_set_kv /etc/audit/auditd.conf "max_log_file"          50
+_set_kv /etc/audit/auditd.conf "num_logs"              5
+_set_kv /etc/audit/auditd.conf "space_left_action"     email
+_set_kv /etc/audit/auditd.conf "action_mail_acct"      root
+_set_kv /etc/audit/auditd.conf "admin_space_left_action" halt
+_set_kv /etc/audit/auditd.conf "max_log_file_action"   keep_logs
+_set_kv /etc/audit/auditd.conf "log_format"            ENRICHED
+
+# =============================================================================
+# 15. AUDIT RULES  (CIS 4.1.x)
+# =============================================================================
+info "Writing audit rules..."
+cat > /etc/audit/rules.d/CIS.rules << "EOF"
+## CIS RHEL 9 Benchmark v2.0 – Section 4.1
+## ─────────────────────────────────────────────
+## Clear existing rules; set buffer and failure mode
+-D
+-b 8192
+-f 2
+
+## ── 4.1.3.1  Time changes ────────────────────────────────────────────────
+-a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time-change
+-a always,exit -F arch=b32 -S adjtimex -S settimeofday -S stime -k time-change
+-a always,exit -F arch=b64 -S clock_settime -k time-change
+-a always,exit -F arch=b32 -S clock_settime -k time-change
+-w /etc/localtime -p wa -k time-change
+
+## ── 4.1.3.2  Identity files ──────────────────────────────────────────────
+-w /etc/group              -p wa -k identity
+-w /etc/passwd             -p wa -k identity
+-w /etc/gshadow            -p wa -k identity
+-w /etc/shadow             -p wa -k identity
+-w /etc/security/opasswd   -p wa -k identity
+
+## ── 4.1.3.3  Network / locale changes ────────────────────────────────────
+-a always,exit -F arch=b64 -S sethostname -S setdomainname -k system-locale
+-a always,exit -F arch=b32 -S sethostname -S setdomainname -k system-locale
+-w /etc/issue              -p wa -k system-locale
+-w /etc/issue.net          -p wa -k system-locale
+-w /etc/hosts              -p wa -k system-locale
+
+## ── 4.1.3.4  Login/session events ────────────────────────────────────────
+-w /var/log/faillog  -p wa -k logins
+-w /var/log/lastlog  -p wa -k logins
+-w /run/faillock/    -p wa -k logins
+-w /var/run/utmp     -p wa -k session
+-w /var/log/wtmp     -p wa -k session
+-w /var/log/btmp     -p wa -k session
+
+## ── 4.1.3.5  Permission / ownership changes ──────────────────────────────
+-a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown  -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S chown -S fchown -S fchownat -S lchown  -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b64 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=-1 -k perm_mod
+
+## ── 4.1.3.6  Unsuccessful file access ────────────────────────────────────
+-a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM  -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM  -F auid>=1000 -F auid!=-1 -k access
+
+## ── 4.1.3.7  Privileged commands ─────────────────────────────────────────
+-a always,exit -F path=/usr/bin/passwd   -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/sudo     -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/su       -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chage    -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/newgrp   -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chsh     -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chfn     -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/gpasswd  -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/sbin/useradd -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/sbin/userdel -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+
+## ── 4.1.3.8  Mounts ──────────────────────────────────────────────────────
+-a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=-1 -k mounts
+-a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=-1 -k mounts
+
+## ── 4.1.3.9  File deletion ───────────────────────────────────────────────
+-a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=-1 -k delete
+-a always,exit -F arch=b32 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=-1 -k delete
+
+## ── 4.1.3.10 sudo / sudoers ──────────────────────────────────────────────
+-w /etc/sudoers    -p wa -k scope
+-w /etc/sudoers.d/ -p wa -k scope
+-w /var/log/sudo.log -p wa -k actions
+
+## ── 4.1.3.11 Kernel module operations ────────────────────────────────────
+-w /sbin/insmod   -p x -k modules
+-w /sbin/rmmod    -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-a always,exit -F arch=b64 -S init_module -S finit_module -S delete_module -k modules
+-a always,exit -F arch=b32 -S init_module -S finit_module -S delete_module -k modules
+
+## ── 4.1.3.12 MAC / SELinux policy ────────────────────────────────────────
+-w /etc/selinux/    -p wa -k MAC-policy
+-w /usr/share/selinux/ -p wa -k MAC-policy
+
+## ── 4.1.3.13 Power / shutdown ────────────────────────────────────────────
+-w /usr/bin/systemctl -p x -k power
+
+## ── 4.1.3.14 fapolicyd policy ────────────────────────────────────────────
+-w /etc/fapolicyd/     -p wa -k fapolicyd
+
+## ── 4.1.3.15 Immutable – load these rules last ───────────────────────────
+-e 2
+EOF
+
+info "Loading audit rules..."
+augenrules --load 2>/dev/null || augenrules
+
+# =============================================================================
+# 16. CRON  (CIS 5.1)
+# =============================================================================
+info "Configuring cron..."
+dnf -y install cronie >> "${AUDITDIR}/pkg_install_${TIME}.log" 2>&1 || true
+systemctl enable --now crond
+
+for entry in anacrontab crontab cron.hourly cron.daily cron.weekly cron.monthly cron.d; do
+  if [[ -e /etc/${entry} ]]; then
+    chown root:root /etc/${entry}
+    [[ -d /etc/${entry} ]] && chmod 700 /etc/${entry} || chmod 600 /etc/${entry}
+  fi
+done
+
+for cmd in at cron; do
+  touch /etc/${cmd}.allow
+  chown root:root /etc/${cmd}.allow
+  chmod 600 /etc/${cmd}.allow
+  rm -f /etc/${cmd}.deny
+done
+
+# =============================================================================
+# 17. LOGIN BANNER  (CIS 1.7)
+# =============================================================================
+info "Configuring login banners..."
+
+cp -p /etc/issue.net "${AUDITDIR}/issue.net_${TIME}.bak" 2>/dev/null || true
+cat > /etc/issue.net << 'EOF'
+/------------------------------------------------------------------------\
+|                       *** NOTICE TO USERS ***                          |
+|                                                                        |
+| This computer system is the private property of YOUR_COMPANY_NAME      |
+| It is for authorized use only.                                         |
+|                                                                        |
+| Users (authorized or unauthorized) have no explicit or implicit        |
+| expectation of privacy.                                                |
+|                                                                        |
+| Any or all uses of this system and all files on this system may be     |
+| intercepted, monitored, recorded, copied, audited, inspected, and      |
+| disclosed to your employer, to authorized site, government, and law    |
+| enforcement personnel, as well as authorized officials of government   |
+| agencies, both domestic and foreign.                                   |
+|                                                                        |
+| By using this system, the user consents to such interception,          |
+| monitoring, recording, copying, auditing, inspection, and disclosure   |
+| at the discretion of such personnel or officials. Unauthorized or      |
+| improper use of this system may result in civil and criminal penalties  |
+| and administrative or disciplinary action, as appropriate. By          |
+| continuing to use this system you indicate your awareness of and       |
+| consent to these terms and conditions of use. LOG OFF IMMEDIATELY if   |
+| you do not agree to the conditions stated in this warning.             |
+\------------------------------------------------------------------------/
+EOF
+
+cp -p /etc/motd "${AUDITDIR}/motd_${TIME}.bak" 2>/dev/null || true
+echo "YOUR_COMPANY_NAME AUTHORIZED USE ONLY" > /etc/motd
+
+rm -f /etc/issue
+ln -s /etc/issue.net /etc/issue
+
+chmod 644 /etc/issue.net /etc/motd
+
+# =============================================================================
+# 18. SSH HARDENING  (CIS 5.2)
+# =============================================================================
+info "Hardening SSH configuration..."
+# RHEL 9 supports drop-in config directory – write to dedicated file
+# The main sshd_config ships with: Include /etc/ssh/sshd_config.d/*.conf
+mkdir -p /etc/ssh/sshd_config.d
+SSHD_DROP="/etc/ssh/sshd_config.d/50-CIS-hardening.conf"
+cp /etc/ssh/sshd_config "${AUDITDIR}/sshd_config_${TIME}.bak"
+[[ -f "${SSHD_DROP}" ]] && cp "${SSHD_DROP}" "${AUDITDIR}/sshd_drop_${TIME}.bak"
+
+# Ensure main sshd_config has the Include directive
+grep -q "^Include /etc/ssh/sshd_config.d/\*.conf" /etc/ssh/sshd_config \
+  || sed -i '1s|^|Include /etc/ssh/sshd_config.d/*.conf\n\n|' /etc/ssh/sshd_config
+
+# Write all hardened settings to the drop-in file
+cat > "${SSHD_DROP}" << 'EOF'
+# CIS RHEL 9 Benchmark v2.0 – Section 5.2
+# Managed by CIS hardening script – do not edit manually
+
+## Authentication
+PermitRootLogin          no
+PermitEmptyPasswords     no
+PermitUserEnvironment    no
+HostbasedAuthentication  no
+IgnoreRhosts             yes
+UsePAM                   yes
+MaxAuthTries             4
+LoginGraceTime           60
+
+## Session
+ClientAliveInterval      300
+ClientAliveCountMax      0
+MaxStartups              10:30:60
+TCPKeepAlive             no
+
+## Forwarding / tunnelling
+X11Forwarding            no
+AllowTcpForwarding       no
+AllowAgentForwarding     no
+GatewayPorts             no
+
+## Logging
+LogLevel                 VERBOSE
+PrintLastLog             yes
+SyslogFacility           AUTHPRIV
+
+## Cryptography
+# Ciphers: prefer ChaCha20 and AES-GCM; retain AES-CTR fallbacks
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+
+# MACs: ETM variants mandatory first
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+
+# Key exchange: modern Curve25519 and large-group DH only
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256
+
+## Banner
+Banner /etc/issue.net
+EOF
+
+chown root:root "${SSHD_DROP}"
+chmod 600 "${SSHD_DROP}"
+chown root:root /etc/ssh/sshd_config
+chmod 600 /etc/ssh/sshd_config
+
+# Validate before restarting
+if sshd -t 2>/dev/null; then
+  systemctl restart sshd >> "${AUDITDIR}/svc_restart_${TIME}.log" 2>&1
+  info "sshd restarted successfully."
+else
+  error "sshd config validation failed – NOT restarting sshd. Review ${SSHD_DROP}"
+fi
+
+# =============================================================================
+# 19. KERNEL & NETWORK PARAMETERS  (CIS 3.x, 1.5.x)
+# =============================================================================
+info "Applying kernel hardening parameters via sysctl..."
+cp /etc/sysctl.conf "${AUDITDIR}/sysctl.conf_${TIME}.bak"
+
+cat > /etc/sysctl.d/99-CIS.conf << 'EOF'
+# CIS RHEL 9 Benchmark v2.0 – Sections 3.x / 1.5.x
+
+## ── IPv4 network hardening ────────────────────────────────────────────────
+net.ipv4.ip_forward                       = 0
+net.ipv4.conf.all.send_redirects          = 0
+net.ipv4.conf.default.send_redirects      = 0
+net.ipv4.conf.all.accept_source_route     = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects        = 0
+net.ipv4.conf.default.accept_redirects    = 0
+net.ipv4.conf.all.secure_redirects        = 0
+net.ipv4.conf.default.secure_redirects    = 0
+net.ipv4.conf.all.log_martians            = 1
+net.ipv4.conf.default.log_martians        = 1
+net.ipv4.icmp_echo_ignore_broadcasts      = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.rp_filter               = 1
+net.ipv4.conf.default.rp_filter           = 1
+net.ipv4.tcp_syncookies                   = 1
+
+## ── IPv6 – fully disabled ────────────────────────────────────────────────
+net.ipv6.conf.all.disable_ipv6            = 1
+net.ipv6.conf.default.disable_ipv6       = 1
+net.ipv6.conf.lo.disable_ipv6            = 1
+net.ipv6.conf.all.accept_ra               = 0
+net.ipv6.conf.default.accept_ra           = 0
+net.ipv6.conf.all.accept_redirects        = 0
+net.ipv6.conf.default.accept_redirects    = 0
+
+## ── Kernel memory / process hardening ────────────────────────────────────
+# Full ASLR
+kernel.randomize_va_space                 = 2
+# Hide kernel symbol addresses from non-root
+kernel.kptr_restrict                      = 2
+# Restrict /dev/kmsg and dmesg to root
+kernel.dmesg_restrict                     = 1
+# Restrict ptrace to parent processes only
+kernel.yama.ptrace_scope                  = 2
+# Restrict perf_event to privileged users
+kernel.perf_event_paranoid                = 3
+# Disable SysRq key
+kernel.sysrq                              = 0
+# Disable core dumps from SUID programs
+fs.suid_dumpable                          = 0
+# Protect against hard/symlink attacks
+fs.protected_hardlinks                    = 1
+fs.protected_symlinks                     = 1
+# Protect FIFOs and regular files
+fs.protected_fifos                        = 2
+fs.protected_regular                      = 2
+
+## ── Unprivileged user namespaces (RHEL 9 specific) ───────────────────────
+# Disable unprivileged user namespaces to reduce container escape surface
+user.max_user_namespaces                  = 0
+EOF
+
+# Apply immediately
+sysctl --system
+
+# =============================================================================
+# 20. DISABLE IPv6 IN MODPROBE  (CIS 3.1.2)
+# =============================================================================
+info "Disabling IPv6 kernel module..."
+grep -qF "options ipv6 disable=1" /etc/modprobe.d/ipv6.conf 2>/dev/null \
+  || echo "options ipv6 disable=1" >> /etc/modprobe.d/ipv6.conf
+
+# =============================================================================
+# 21. FIREWALL – nftables  (CIS 3.5)
+# =============================================================================
+info "Configuring nftables firewall..."
+systemctl enable --now nftables
+
+# Ensure firewalld and iptables are not conflicting
+systemctl disable --now firewalld  2>/dev/null || true
+systemctl disable --now iptables   2>/dev/null || true
+systemctl disable --now ip6tables  2>/dev/null || true
+
+# Write a minimal deny-by-default nftables ruleset
+cp /etc/nftables/main.nft "${AUDITDIR}/nftables_${TIME}.bak" 2>/dev/null || true
+cat > /etc/nftables/main.nft << 'EOF'
+#!/usr/sbin/nft -f
+# CIS RHEL 9 Benchmark v2.0 – Section 3.5
+# Default-deny with stateful tracking for established connections
+
+flush ruleset
+
+table inet filter {
+
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    # Allow loopback
+    iif "lo" accept
+
+    # Drop invalid packets
+    ct state invalid drop
+
+    # Allow established/related connections
+    ct state { established, related } accept
+
+    # Allow ICMP (rate-limited) – required for basic network operation
+    ip protocol icmp  limit rate 10/second accept
+    ip6 nexthdr icmpv6 limit rate 10/second accept
+
+    # Allow SSH – restrict to a management network if possible
+    tcp dport 22 ct state new accept
+
+    # Log and drop everything else
+    log prefix "nftables-drop: " level info
+    drop
+  }
+
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+  }
+
+  chain output {
+    type filter hook output priority 0; policy accept;
+  }
+}
+EOF
+
+nft -f /etc/nftables/main.nft && info "nftables ruleset applied." \
+  || warn "nftables ruleset failed to load – review /etc/nftables/main.nft"
+
+# =============================================================================
+# 22. WIRELESS  (CIS 3.1.2)
+# =============================================================================
+info "Disabling wireless interfaces..."
+nmcli radio all off 2>/dev/null || true
+
+# =============================================================================
+# 23. CRYPTO POLICY  (CIS 1.10)
+# =============================================================================
+info "Setting system-wide crypto policy to FUTURE..."
+# RHEL 9 DEFAULT already excludes SHA-1; FUTURE further hardens (removes DH<3072, etc.)
+update-crypto-policies --set FUTURE >/dev/null
+
+# =============================================================================
+# 24. SU RESTRICTION  (CIS 5.6)
+# =============================================================================
+info "Restricting su to wheel group..."
+cp /etc/pam.d/su "${AUDITDIR}/su_${TIME}.bak"
+sed -i '/pam_wheel\.so/d' /etc/pam.d/su
+sed -i '/^auth\s.*pam_rootok\.so/a auth\t\trequired\tpam_wheel.so use_uid' /etc/pam.d/su
+gpasswd -a root wheel >/dev/null 2>&1 || true
+
+# =============================================================================
+# 25. SUDO HARDENING  (CIS 5.3)
+# =============================================================================
+info "Hardening sudo configuration..."
+# Require a TTY for sudo
+grep -qF "Defaults requiretty" /etc/sudoers \
+  || echo "Defaults requiretty" >> /etc/sudoers
+
+# Restrict sudo log
+grep -qF "Defaults logfile" /etc/sudoers \
+  || echo "Defaults logfile=\"/var/log/sudo.log\"" >> /etc/sudoers
+
+# Disable sudo authentication token timeout (re-auth every session)
+grep -qF "Defaults timestamp_timeout=0" /etc/sudoers \
+  || echo "Defaults timestamp_timeout=0" >> /etc/sudoers
+
+# =============================================================================
+# 26. DEFAULT UMASK  (CIS 5.4.4)
+# =============================================================================
+info "Setting default umask for users..."
+for profile in /etc/bashrc /etc/profile; do
+  line_num=$(grep -n "^[[:space:]]*umask" "${profile}" | head -1 | cut -d: -f1)
+  if [[ -n "${line_num}" ]]; then
+    sed -i "${line_num}s/umask [0-9]*/umask 027/" "${profile}"
+  else
+    echo "umask 027" >> "${profile}"
+  fi
+done
+
+cat > /etc/profile.d/CIS-umask.sh << "EOF"
+# CIS RHEL 9 Benchmark v2.0 – Section 5.4.4
+umask 027
+EOF
+chmod 644 /etc/profile.d/CIS-umask.sh
+
+# =============================================================================
+# 27. SHELL HISTORY  (CIS 5.4.5)
+# =============================================================================
+info "Configuring shell history..."
+grep -q "HISTTIMEFORMAT=" /etc/profile \
+  || echo 'export HISTTIMEFORMAT="%d.%m.%y %T  "' >> /etc/profile
+grep -q "^HISTSIZE=" /etc/profile \
+  && sed -i -E 's/^HISTSIZE.*/HISTSIZE=10000/' /etc/profile \
+  || echo "HISTSIZE=10000" >> /etc/profile
+grep -q "HISTCONTROL=" /etc/profile \
+  || echo 'export HISTCONTROL=ignoredups:ignorespace' >> /etc/profile
+
+# =============================================================================
+# 28. USER ACCOUNT POLICY  (CIS 5.4, 5.5)
+# =============================================================================
+info "Configuring user account policy..."
+useradd -D -f 30
+
+_set_kv /etc/login.defs "PASS_MAX_DAYS" 90
+_set_kv /etc/login.defs "PASS_MIN_DAYS" 7
+_set_kv /etc/login.defs "PASS_WARN_AGE" 7
+_set_kv /etc/login.defs "UID_MIN"       1000
+_set_kv /etc/login.defs "ENCRYPT_METHOD" SHA512
+_set_kv /etc/login.defs "SHA_CRYPT_MIN_ROUNDS" 5000
+
+# =============================================================================
+# 29. SYSTEM FILE PERMISSIONS  (CIS 6.1)
+# =============================================================================
+info "Verifying critical file permissions..."
+chown root:root /etc/passwd  && chmod 644 /etc/passwd
+chown root:root /etc/shadow  && chmod 000 /etc/shadow
+chown root:root /etc/gshadow && chmod 000 /etc/gshadow
+chown root:root /etc/group   && chmod 644 /etc/group
+
+for grubcfg in /boot/grub2/grub.cfg /boot/efi/EFI/redhat/grub.cfg \
+               /boot/efi/EFI/almalinux/grub.cfg /boot/efi/EFI/rocky/grub.cfg; do
+  if [[ -f "${grubcfg}" ]]; then
+    chown root:root "${grubcfg}"
+    chmod 600 "${grubcfg}"
+  fi
+done
+
+chmod 600 /etc/rsyslog.conf
+
+# =============================================================================
+# 30. STICKY BIT ON WORLD-WRITABLE DIRECTORIES  (CIS 1.1.22)
+# =============================================================================
+info "Setting sticky bit on world-writable directories..."
+df --local -P \
+  | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type d \( -perm -0002 -a ! -perm -1000 \) 2>/dev/null \
+  | xargs -r chmod a+t \
+  >> "${AUDITDIR}/sticky_${TIME}.log" 2>&1 || true
+
+# =============================================================================
+# 31. AIDE – FILE INTEGRITY  (CIS 1.3.1)
+# =============================================================================
+info "Initialising AIDE file-integrity database (this may take a few minutes)..."
+if command -v aide &>/dev/null; then
+  aide --init >> "${AUDITDIR}/aide_init_${TIME}.log" 2>&1 \
+    && mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz \
+    && info "AIDE database created at /var/lib/aide/aide.db.gz" \
+    || warn "AIDE initialisation failed – check ${AUDITDIR}/aide_init_${TIME}.log"
+
+  # Schedule daily AIDE check
+  cat > /etc/cron.daily/aide << 'EOF'
+#!/bin/bash
+/usr/sbin/aide --check | /usr/bin/mail -s "AIDE Integrity Check: $(hostname)" root
+EOF
+  chmod 700 /etc/cron.daily/aide
+  chown root:root /etc/cron.daily/aide
+else
+  warn "aide binary not found – skipping AIDE initialisation"
+fi
+
+# =============================================================================
+# 32. FAPOLICYD – APPLICATION ALLOWLISTING  (CIS 1.7)
+# =============================================================================
+info "Enabling fapolicyd (application allowlisting)..."
+if systemctl list-unit-files fapolicyd.service &>/dev/null; then
+  # Update trust database before enabling
+  fagenrules --load 2>/dev/null || true
+  systemctl enable --now fapolicyd
+  info "fapolicyd enabled."
+else
+  warn "fapolicyd service not found – was the package installed?"
+fi
+
+# =============================================================================
+# 33. USBGUARD  (CIS 1.1.1.8)
+# =============================================================================
+info "Configuring USBGuard..."
+if command -v usbguard &>/dev/null; then
+  # Generate policy based on currently connected devices, then enable
+  usbguard generate-policy > /etc/usbguard/rules.conf 2>/dev/null \
+    && info "USBGuard policy generated from connected devices." \
+    || warn "USBGuard policy generation failed – check connected devices."
+  chmod 600 /etc/usbguard/rules.conf
+  systemctl enable --now usbguard
+else
+  warn "USBGuard not found – skipping."
+fi
+
+# =============================================================================
+# 34. AUDIT REPORTS  (informational – do not auto-remediate)
+# =============================================================================
+info "Generating audit reports..."
+
+df --local -P | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type f -perm -0002 2>/dev/null \
+  >> "${AUDITDIR}/world_writable_files_${TIME}.log" || true
+
+df --local -P | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -nouser -ls 2>/dev/null \
+  >> "${AUDITDIR}/unowned_files_${TIME}.log" || true
+
+df --local -P | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -nogroup -ls 2>/dev/null \
+  >> "${AUDITDIR}/ungrouped_files_${TIME}.log" || true
+
+df --local -P | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type f -perm -4000 -print 2>/dev/null \
+  >> "${AUDITDIR}/suid_exec_${TIME}.log" || true
+
+df --local -P | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type f -perm -2000 -print 2>/dev/null \
+  >> "${AUDITDIR}/sgid_exec_${TIME}.log" || true
+
+awk -F: '($2 == "") { print $1 " has no password" }' /etc/shadow \
+  >> "${AUDITDIR}/empty_passwd_${TIME}.log" || true
+
+# =============================================================================
+# 35. USER / GROUP INTEGRITY CHECKS  (CIS 6.2)
+# =============================================================================
+info "Running user and group integrity checks..."
+{
+  echo "=== NIS/'+' entries ==="
+  grep '^+:' /etc/passwd /etc/shadow /etc/group 2>/dev/null || echo "None found."
+
+  echo "=== UID-0 accounts (should be root only) ==="
+  awk -F: '($3 == 0) { print $1 }' /etc/passwd
+
+  echo "=== Duplicate UIDs ==="
+  cut -f3 -d: /etc/passwd | sort -n | uniq -d | while IFS= read -r uid; do
+    users=$(awk -F: -v u="${uid}" '$3==u{printf "%s ", $1}' /etc/passwd)
+    echo "  UID ${uid}: ${users}"
+  done
+
+  echo "=== Duplicate GIDs ==="
+  cut -f3 -d: /etc/group | sort -n | uniq -d | while IFS= read -r gid; do
+    grps=$(awk -F: -v g="${gid}" '$3==g{printf "%s ", $1}' /etc/group)
+    echo "  GID ${gid}: ${grps}"
+  done
+
+  echo "=== Duplicate user names ==="
+  cut -f1 -d: /etc/passwd | sort | uniq -d
+
+  echo "=== Duplicate group names ==="
+  cut -f1 -d: /etc/group | sort | uniq -d
+
+  echo "=== Groups in /etc/passwd missing from /etc/group ==="
+  cut -s -d: -f4 /etc/passwd | sort -u | while IFS= read -r gid; do
+    grep -qP "^[^:]*:[^:]*:${gid}:" /etc/group \
+      || echo "  GID ${gid} missing from /etc/group"
+  done
+
+  echo "=== Home directories (UID >= 1000) ==="
+  awk -F: '$3>=1000 && $1!="nfsnobody" { print $1, $3, $6 }' /etc/passwd | \
+  while read -r user uid dir; do
+    if [[ ! -d "${dir}" ]]; then
+      echo "  Home dir missing for ${user} (uid=${uid}): ${dir}"
+    else
+      owner=$(stat -L -c "%U" "${dir}" 2>/dev/null || echo "?")
+      [[ "${owner}" != "${user}" ]] \
+        && echo "  Home dir ${dir} owned by ${owner} (expected ${user})"
+    fi
+  done
+
+  echo "=== Sensitive dotfiles ==="
+  awk -F: '$6 != "" { print $6 }' /etc/passwd | while IFS= read -r dir; do
+    for f in "${dir}/.netrc" "${dir}/.rhosts" "${dir}/.forward"; do
+      [[ -f "${f}" && ! -h "${f}" ]] && echo "  FOUND: ${f}"
+    done
+  done
+
+} >> "${AUDITDIR}/user_group_audit_${TIME}.log"
+
+info "User/group audit written to ${AUDITDIR}/user_group_audit_${TIME}.log"
+
+# =============================================================================
+# DONE
+# =============================================================================
+echo ""
+echo -e "${GREEN}============================================================${NC}"
+echo -e "${GREEN}  RHEL 9 CIS Hardening completed successfully.${NC}"
+echo -e "${GREEN}  Audit artefacts : ${AUDITDIR}${NC}"
+echo ""
+echo -e "${YELLOW}  ACTION REQUIRED BEFORE PRODUCTION:${NC}"
+echo "  1. Replace YOUR_COMPANY_NAME in /etc/issue.net and /etc/motd"
+echo "  2. Review nftables rules in /etc/nftables/main.nft"
+echo "     and open only the ports this server actually requires."
+echo "  3. If this is a container host, review:"
+echo "     user.max_user_namespaces=0 in /etc/sysctl.d/99-CIS.conf"
+echo "     (container runtimes may need >0)"
+echo "  4. Verify fapolicyd policy does not block legitimate workloads."
+echo "  5. REBOOT to apply: kernel module, sysctl, crypto-policy,"
+echo "     and IPv6 disable changes."
+echo -e "${GREEN}============================================================${NC}"
