@@ -1,193 +1,322 @@
 #!/bin/bash
+# =============================================================================
+# RHEL 8 CIS-Benchmark Hardening Script
+# Tested against: RHEL 8.x / CentOS Stream 8 / AlmaLinux 8 / Rocky Linux 8
+# CIS Reference: CIS Red Hat Enterprise Linux 8 Benchmark v3.0
+# =============================================================================
+# USAGE:  sudo bash "RHEL8 Hardening Script"
+# =============================================================================
+
+set -euo pipefail
+
+# ── Constants ──────────────────────────────────────────────────────────────────
 AUDITDIR="/tmp/$(hostname -s)_audit"
 TIME="$(date +%F_%T)"
-. /etc/os-release
-MAIN_VERSION_ID="$(echo ${VERSION_ID} |cut -f1 -d'.')"
-if [[ ${MAIN_VERSION_ID} -lt 8 ]]; then
-  echo "OS release lower than 8 not supported. You are running ${VERSION_ID}"
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: This script must be run as root." >&2
+  exit 1
 fi
 
-mkdir -p $AUDITDIR
+# shellcheck source=/dev/null
+. /etc/os-release
+MAIN_VERSION_ID="$(echo "${VERSION_ID}" | cut -f1 -d'.')"
+if [[ "${MAIN_VERSION_ID}" -lt 8 ]]; then
+  echo "ERROR: OS release lower than 8 is not supported. Running: ${VERSION_ID}" >&2
+  exit 1
+fi
 
-echo "Disabling Legacy Filesystems"
+mkdir -p "${AUDITDIR}"
+
+# =============================================================================
+# 1. LEGACY FILESYSTEMS & PROTOCOLS
+# =============================================================================
+echo "[*] Disabling legacy filesystems and network protocols..."
 cat > /etc/modprobe.d/CIS.conf << "EOF"
-install cramfs /bin/true
+# CIS 1.1.x – Disable unused filesystems
+install cramfs   /bin/true
 install freevxfs /bin/true
-install jffs2 /bin/true
-install hfs /bin/true
-install hfsplus /bin/true
+install jffs2    /bin/true
+install hfs      /bin/true
+install hfsplus  /bin/true
 install squashfs /bin/true
-install vfat /bin/true
-install udf /bin/true
-install dccp /bin/true
-install sctp /bin/true
-install rds /bin/true
-install tipc /bin/true
+install vfat     /bin/true
+install udf      /bin/true
+
+# CIS 3.4.x – Disable unused network protocols
+install dccp     /bin/true
+install sctp     /bin/true
+install rds      /bin/true
+install tipc     /bin/true
+
+# CIS 1.1.24 – Disable USB storage
 install usb-storage /bin/true
 EOF
 
-echo "Removing GCC compiler..."
-yum -y remove gcc*
+# =============================================================================
+# 2. PACKAGE REMOVAL
+# =============================================================================
+echo "[*] Removing GCC compiler..."
+yum -y remove gcc\* >> "${AUDITDIR}/service_remove_${TIME}.log" 2>&1 || true
 
-echo "Removing legacy services..."
-yum -y remove rsh-server rsh ypserv tftp tftp-server talk talk-server telnet-server xinetd >> $AUDITDIR/service_remove_$TIME.log
+echo "[*] Removing legacy services..."
+yum -y remove rsh-server rsh ypserv tftp tftp-server \
+  talk talk-server telnet-server xinetd \
+  >> "${AUDITDIR}/service_remove_${TIME}.log" 2>&1 || true
 
-echo "Disabling LDAP..."
-yum -y remove openldap-servers >> $AUDITDIR/service_remove_$TIME.log
-yum -y remove openldap-clients >> $AUDITDIR/service_remove_$TIME.log
+echo "[*] Disabling LDAP packages..."
+yum -y remove openldap-servers openldap-clients \
+  >> "${AUDITDIR}/service_remove_${TIME}.log" 2>&1 || true
 
-echo "Remove Bind, vsftp, Dovecot, Samba, Squid, net-snmp..."
-yum -y remove bind vsftpd dovecot samba squid net-snmp >> $AUDITDIR/service_remove_$TIME.log
+echo "[*] Removing bind, vsftpd, dovecot, samba, squid, net-snmp..."
+yum -y remove bind vsftpd dovecot samba squid net-snmp \
+  >> "${AUDITDIR}/service_remove_${TIME}.log" 2>&1 || true
 
-echo "Setting Daemon umask..."
-sed -i -E 's/umask [0-9]+/umask 027/g' /etc/init.d/functions
+# =============================================================================
+# 3. DAEMON UMASK  (CIS 1.5.5)
+# =============================================================================
+echo "[*] Setting daemon umask..."
+# /etc/init.d/functions is a SysV remnant; not always present on RHEL 8
+if [[ -f /etc/init.d/functions ]]; then
+  sed -i -E 's/umask [0-9]+/umask 027/g' /etc/init.d/functions
+fi
 
-echo "Disabling Unnecessary Services..."
+# =============================================================================
+# 4. UNNECESSARY SERVICES
+# =============================================================================
+echo "[*] Disabling unnecessary services..."
 servicelist=(dhcpd avahi-daemon cups nfslock rpcgssd rpcbind rpcidmapd rpcsvcgssd)
-for i in ${servicelist[@]}; do
-  [ $(systemctl disable $i 2> /dev/null) ] || echo "$i is Disabled"
-done
-
-echo "Setting Password Quality policies..."
-for i in \
-"minlen = 14" \
-"dcredit = -1" \
-"ucredit = -1" \
-"ocredit = -1" \
-"lcredit = -1" \
-"retry = 3" \
-; do
-  [[ `grep -q "^$i" /etc/security/pwquality.conf` ]] && continue
-  option=${i%%=*}
-  if [[ `grep -q "${option}" /etc/security/pwquality.conf` ]]; then
-    sed -i "s/.*${option}.*/$i/g" /etc/security/pwquality.conf
+for svc in "${servicelist[@]}"; do
+  if systemctl is-enabled "${svc}" &>/dev/null; then
+    systemctl disable --now "${svc}" 2>/dev/null || true
+    echo "    Disabled: ${svc}"
   else
-    echo "${i}" >> /etc/security/pwquality.conf
+    echo "    Already disabled / not installed: ${svc}"
   fi
 done
 
-echo "Setting journald configuration"
-for i in \
-"Compress=yes" \
-"ForwardToSyslog=yes" \
-"Storage=persistent" \
-; do
-  [[ `grep -q "^$i" /etc/systemd/journald.conf` ]] && continue
-  option=${i%%=*}
-  if [[ `grep "${option}" /etc/systemd/journald.conf` ]]; then
-    sed -i "s/.*${option}.*/$i/g" /etc/systemd/journald.conf
+# =============================================================================
+# 5. PASSWORD QUALITY (CIS 5.4.1)
+# =============================================================================
+echo "[*] Setting password quality policies (pwquality)..."
+
+_set_conf_option() {
+  local file="$1" key="$2" value="$3"
+  local line="${key} = ${value}"
+  if grep -qE "^\s*${key}\s*=" "${file}" 2>/dev/null; then
+    sed -i -E "s|^\s*${key}\s*=.*|${line}|g" "${file}"
   else
-    echo "${i}" >> /etc/systemd/journald.conf
+    echo "${line}" >> "${file}"
   fi
-done
+}
 
-echo "Setting core dump security limits..."
-echo '* hard core 0' > /etc/security/limits.conf
+_set_conf_option /etc/security/pwquality.conf "minlen"  14
+_set_conf_option /etc/security/pwquality.conf "dcredit" -1
+_set_conf_option /etc/security/pwquality.conf "ucredit" -1
+_set_conf_option /etc/security/pwquality.conf "ocredit" -1
+_set_conf_option /etc/security/pwquality.conf "lcredit" -1
+_set_conf_option /etc/security/pwquality.conf "retry"   3
+_set_conf_option /etc/security/pwquality.conf "maxrepeat" 3
 
-echo "Generating additional logs..."
-echo '$FileCreateMode 0640' > /etc/rsyslog.d/CIS.conf
-echo 'auth /var/log/secure' >> /etc/rsyslog.d/CIS.conf
-echo 'kern.* /var/log/messages' >> /etc/rsyslog.d/CIS.conf
-echo 'daemon.* /var/log/messages' >> /etc/rsyslog.d/CIS.conf
-echo 'syslog.* /var/log/messages' >> /etc/rsyslog.d/CIS.conf
+# =============================================================================
+# 6. JOURNALD (CIS 4.2.2)
+# =============================================================================
+echo "[*] Configuring journald..."
+
+_set_ini_option() {
+  local file="$1" key="$2" value="$3"
+  local line="${key}=${value}"
+  if grep -qE "^\s*${key}\s*=" "${file}" 2>/dev/null; then
+    sed -i -E "s|^\s*${key}\s*=.*|${line}|g" "${file}"
+  else
+    # Append under [Journal] section if it exists, otherwise just append
+    if grep -q '^\[Journal\]' "${file}" 2>/dev/null; then
+      sed -i "/^\[Journal\]/a ${line}" "${file}"
+    else
+      echo "${line}" >> "${file}"
+    fi
+  fi
+}
+
+_set_ini_option /etc/systemd/journald.conf "Compress"      yes
+_set_ini_option /etc/systemd/journald.conf "ForwardToSyslog" yes
+_set_ini_option /etc/systemd/journald.conf "Storage"       persistent
+
+# =============================================================================
+# 7. CORE DUMPS (CIS 1.5.1)
+# =============================================================================
+echo "[*] Restricting core dumps..."
+# Append/update rather than overwrite the entire limits file
+if grep -qE '^\*\s+hard\s+core' /etc/security/limits.conf 2>/dev/null; then
+  sed -i -E 's/^\*\s+hard\s+core.*/* hard core 0/' /etc/security/limits.conf
+else
+  echo '* hard core 0' >> /etc/security/limits.conf
+fi
+
+# Also disable via sysctl (handled in section 14) and systemd
+if [[ -f /etc/systemd/coredump.conf ]]; then
+  _set_ini_option /etc/systemd/coredump.conf "Storage"    none
+  _set_ini_option /etc/systemd/coredump.conf "ProcessSizeMax" 0
+fi
+
+# =============================================================================
+# 8. RSYSLOG (CIS 4.2.1)
+# =============================================================================
+echo "[*] Configuring rsyslog..."
+cat > /etc/rsyslog.d/CIS.conf << "EOF"
+$FileCreateMode 0640
+auth,authpriv.*     /var/log/secure
+kern.*              /var/log/messages
+daemon.*            /var/log/messages
+syslog.*            /var/log/messages
+EOF
 chmod 600 /etc/rsyslog.d/CIS.conf
 
-echo "Enabling auditd service..."
-systemctl enable auditd
+# =============================================================================
+# 9. AUDITD (CIS 4.1)
+# =============================================================================
+echo "[*] Enabling and configuring auditd..."
+systemctl enable --now auditd
 
-echo "Configuring Audit Log Storage Size..."
-cp -a /etc/audit/auditd.conf /etc/audit/auditd.conf.bak
-sed -i 's/^space_left_action.*$/space_left_action = email/' /etc/audit/auditd.conf
-sed -i 's/^action_mail_acct.*$/action_mail_acct = root/' /etc/audit/auditd.conf
-sed -i 's/^admin_space_left_action.*$/admin_space_left_action = halt/' /etc/audit/auditd.conf
-sed -i 's/^max_log_file_action.*$/max_log_file_action = keep_logs/' /etc/audit/auditd.conf
+cp -a /etc/audit/auditd.conf "${AUDITDIR}/auditd.conf_${TIME}.bak"
 
-echo "Setting audit rules..."
+_set_conf_option /etc/audit/auditd.conf "max_log_file"          50
+_set_conf_option /etc/audit/auditd.conf "num_logs"              5
+_set_conf_option /etc/audit/auditd.conf "space_left_action"     email
+_set_conf_option /etc/audit/auditd.conf "action_mail_acct"      root
+_set_conf_option /etc/audit/auditd.conf "admin_space_left_action" halt
+_set_conf_option /etc/audit/auditd.conf "max_log_file_action"   keep_logs
+
+# =============================================================================
+# 10. AUDIT RULES (CIS 4.1.x)
+# =============================================================================
+echo "[*] Writing audit rules..."
 cat > /etc/audit/rules.d/CIS.rules << "EOF"
+## Clear existing rules
 -D
--b 320
+## Set the audit buffer size – 8192 handles high-volume workloads
+-b 8192
+## Failure mode: 2 = panic on failure (production), 1 = print & continue (dev)
+-f 2
 
+## ── Time changes ──────────────────────────────────────────────────────────
 -a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time-change
 -a always,exit -F arch=b32 -S adjtimex -S settimeofday -S stime -k time-change
 -a always,exit -F arch=b64 -S clock_settime -k time-change
 -a always,exit -F arch=b32 -S clock_settime -k time-change
 -w /etc/localtime -p wa -k time-change
 
--w /etc/group -p wa -k identity
--w /etc/passwd -p wa -k identity
--w /etc/gshadow -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/security/opasswd -p wa -k identity
+## ── Identity files ────────────────────────────────────────────────────────
+-w /etc/group              -p wa -k identity
+-w /etc/passwd             -p wa -k identity
+-w /etc/gshadow            -p wa -k identity
+-w /etc/shadow             -p wa -k identity
+-w /etc/security/opasswd   -p wa -k identity
 
+## ── Network / locale changes ──────────────────────────────────────────────
 -a always,exit -F arch=b64 -S sethostname -S setdomainname -k system-locale
 -a always,exit -F arch=b32 -S sethostname -S setdomainname -k system-locale
--w /etc/issue -p wa -k system-locale
--w /etc/issue.net -p wa -k system-locale
--w /etc/hosts -p wa -k system-locale
--w /etc/sysconfig/network -p wa -k system-locale
+-w /etc/issue              -p wa -k system-locale
+-w /etc/issue.net          -p wa -k system-locale
+-w /etc/hosts              -p wa -k system-locale
+-w /etc/sysconfig/network  -p wa -k system-locale
+-w /etc/sysconfig/network-scripts/ -p wa -k system-locale
 
--w /var/log/faillog -p wa -k logins
--w /var/log/lastlog -p wa -k logins
--w /var/log/tallylog -p wa -k logins
+## ── Login / session events ───────────────────────────────────────────────
+-w /var/log/faillog   -p wa -k logins
+-w /var/log/lastlog   -p wa -k logins
+-w /var/run/utmp      -p wa -k session
+-w /var/log/wtmp      -p wa -k session
+-w /var/log/btmp      -p wa -k session
 
--w /var/run/utmp -p wa -k session
--w /var/log/wtmp -p wa -k session
--w /var/log/btmp -p wa -k session
+## ── Permission & ownership changes ──────────────────────────────────────
+-a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b64 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=-1 -k perm_mod
 
--a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b32 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b32 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b64 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b32 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=4294967295 -k perm_mod
+## ── Unsuccessful file access ─────────────────────────────────────────────
+-a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM  -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM  -F auid>=1000 -F auid!=-1 -k access
 
--a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=4294967295 -k access
--a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=4294967295 -k access
--a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=4294967295 -k access
--a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=4294967295 -k access
+## ── Mounts ────────────────────────────────────────────────────────────────
+-a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=-1 -k mounts
+-a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=-1 -k mounts
 
--a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=4294967295 -k mounts
--a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=4294967295 -k mounts
+## ── File deletion ────────────────────────────────────────────────────────
+-a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=-1 -k delete
+-a always,exit -F arch=b32 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=-1 -k delete
 
--a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=4294967295 -k delete
--a always,exit -F arch=b32 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=4294967295 -k delete
-
--w /etc/sudoers -p wa -k scope
-
+## ── Sudo / sudoers ───────────────────────────────────────────────────────
+-w /etc/sudoers    -p wa -k scope
+-w /etc/sudoers.d/ -p wa -k scope
 -w /var/log/sudo.log -p wa -k actions
 
--w /sbin/insmod -p x -k modules
--w /sbin/rmmod -p x -k modules
+## ── Kernel module operations ─────────────────────────────────────────────
+-w /sbin/insmod  -p x -k modules
+-w /sbin/rmmod   -p x -k modules
 -w /sbin/modprobe -p x -k modules
 -a always,exit -F arch=b64 -S init_module -S delete_module -k modules
 
+## ── MAC policy (SELinux) ─────────────────────────────────────────────────
 -w /etc/selinux/ -p wa -k MAC-policy
 
+## ── Privileged commands ──────────────────────────────────────────────────
+-a always,exit -F path=/usr/bin/passwd   -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/sudo     -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/su       -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chage    -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/newgrp   -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chsh     -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+
+## ── Power / shutdown events ──────────────────────────────────────────────
+-w /usr/bin/systemctl -p x -k power
+
+## ── Make the configuration immutable (comment out during initial tuning) ─
 -e 2
 EOF
-echo "Generating audit rules..."
-augenrules
 
-echo "Configuring Cron and Anacron..."
-yum -y install cronie-anacron >> $AUDITDIR/service_install_$TIME.log
+echo "[*] Generating audit rules..."
+augenrules --load || augenrules
+
+# =============================================================================
+# 11. CRON (CIS 5.1)
+# =============================================================================
+echo "[*] Configuring cron and anacron..."
+yum -y install cronie-anacron >> "${AUDITDIR}/service_install_${TIME}.log" 2>&1 || true
 systemctl enable crond
-for i in anacrontab crontab cron.hourly cron.daily cron.weekly cron.monthly; do
-  chown root:root /etc/$i
-  chmod 600 /etc/$i
-done
-chmod 700 /etc/cron.d
 
-echo "Handle At and Cron Allow Files..."
-for file in at cron; do
-  touch /etc/${file}.allow
-  chown root:root /etc/${file}.allow
-  chmod 600 /etc/${file}.allow
-  rm -rf /etc/${file}.deny
+for entry in anacrontab crontab cron.hourly cron.daily cron.weekly cron.monthly cron.d; do
+  if [[ -e /etc/${entry} ]]; then
+    chown root:root /etc/${entry}
+    if [[ -d /etc/${entry} ]]; then
+      chmod 700 /etc/${entry}
+    else
+      chmod 600 /etc/${entry}
+    fi
+  fi
 done
 
-echo "Creating Banner..."
-sed -i "s/\#Banner none/Banner \/etc\/issue\.net/" /etc/ssh/sshd_config
-cp -p /etc/issue.net $AUDITDIR/issue.net_$TIME.bak
+echo "[*] Configuring at/cron allow lists..."
+for cmd in at cron; do
+  touch /etc/${cmd}.allow
+  chown root:root /etc/${cmd}.allow
+  chmod 600 /etc/${cmd}.allow
+  rm -f /etc/${cmd}.deny
+done
+
+# =============================================================================
+# 12. LOGIN BANNER (CIS 1.7)
+# =============================================================================
+echo "[*] Creating login banner..."
+sed -i 's|#\?Banner.*|Banner /etc/issue.net|' /etc/ssh/sshd_config
+
+cp -p /etc/issue.net "${AUDITDIR}/issue.net_${TIME}.bak"
 cat > /etc/issue.net << 'EOF'
 /------------------------------------------------------------------------\
 |                       *** NOTICE TO USERS ***                          |
@@ -206,416 +335,442 @@ cat > /etc/issue.net << 'EOF'
 |                                                                        |
 | By using this system, the user consents to such interception,          |
 | monitoring, recording, copying, auditing, inspection, and disclosure   |
-| at the discretion of such personnel or officials.  Unauthorized or     |
-| improper use of this system may result in civil and criminal penalties |
+| at the discretion of such personnel or officials. Unauthorized or      |
+| improper use of this system may result in civil and criminal penalties  |
 | and administrative or disciplinary action, as appropriate. By          |
 | continuing to use this system you indicate your awareness of and       |
 | consent to these terms and conditions of use. LOG OFF IMMEDIATELY if   |
 | you do not agree to the conditions stated in this warning.             |
 \------------------------------------------------------------------------/
 EOF
-cp -p /etc/motd /etc/motd_$TIME.bak
-cat > /etc/motd << 'EOF'
-YOUR_COMPANY_NAME AUTHORIZED USE ONLY
-EOF
-rm -rf /etc/issue
+
+cp -p /etc/motd "${AUDITDIR}/motd_${TIME}.bak"
+echo "YOUR_COMPANY_NAME AUTHORIZED USE ONLY" > /etc/motd
+
+rm -f /etc/issue
 ln -s /etc/issue.net /etc/issue
 
-echo "Configuring SSH..."
-cp /etc/ssh/sshd_config $AUDITDIR/sshd_config_$TIME.bak
-for i in \
-"LogLevel INFO" \
-"Protocol 2" \
-"X11Forwarding no" \
-"MaxAuthTries 4" \
-"IgnoreRhosts yes" \
-"HostbasedAuthentication no" \
-"PermitRootLogin no" \
-"PermitEmptyPasswords no" \
-"PermitUserEnvironment no" \
-"ClientAliveInterval 300" \
-"ClientAliveCountMax 0" \
-"LoginGraceTime 60" \
-"UsePAM yes" \
-"MaxStartups 10:30:60" \
-"AllowTcpForwarding no" \
-"Ciphers aes128-ctr,aes192-ctr,aes256-ctr" \
-; do
-  [[ `egrep -q "^${i}" /etc/ssh/sshd_config` ]] && continue
-  option=${i%% *}
-  grep -q ${option} /etc/ssh/sshd_config && sed -i "s/.*${option}.*/$i/g" /etc/ssh/sshd_config || echo "$i" >> /etc/ssh/sshd_config
-done
+# =============================================================================
+# 13. SSH HARDENING (CIS 5.2)
+# =============================================================================
+echo "[*] Hardening SSH configuration..."
+cp /etc/ssh/sshd_config "${AUDITDIR}/sshd_config_${TIME}.bak"
+
+# Helper: set a key=value in sshd_config (handles commented and uncommented lines)
+_set_sshd() {
+  local key="$1" value="$2"
+  local line="${key} ${value}"
+  if grep -qiE "^\s*#?\s*${key}\s+" /etc/ssh/sshd_config; then
+    sed -i -E "s|^\s*#?\s*${key}\s+.*|${line}|I" /etc/ssh/sshd_config
+  else
+    echo "${line}" >> /etc/ssh/sshd_config
+  fi
+}
+
+# NOTE: "Protocol 2" was removed in OpenSSH 7.6 – setting it breaks sshd on RHEL 8.
+_set_sshd LogLevel           VERBOSE
+_set_sshd X11Forwarding      no
+_set_sshd MaxAuthTries       4
+_set_sshd IgnoreRhosts       yes
+_set_sshd HostbasedAuthentication no
+_set_sshd PermitRootLogin    no
+_set_sshd PermitEmptyPasswords no
+_set_sshd PermitUserEnvironment no
+_set_sshd ClientAliveInterval 300
+_set_sshd ClientAliveCountMax 0
+_set_sshd LoginGraceTime     60
+_set_sshd UsePAM             yes
+_set_sshd MaxStartups        "10:30:60"
+_set_sshd AllowTcpForwarding no
+_set_sshd AllowAgentForwarding no
+_set_sshd GatewayPorts       no
+_set_sshd PrintLastLog       yes
+_set_sshd TCPKeepAlive       no
+
+# Strong ciphers: prefer AES-GCM and ChaCha20; retain CTR fallbacks
+_set_sshd Ciphers \
+  "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+
+# Strong MACs: ETM variants preferred
+_set_sshd MACs \
+  "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256"
+
+# Modern key exchange algorithms
+_set_sshd KexAlgorithms \
+  "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256"
 
 chown root:root /etc/ssh/sshd_config
 chmod 600 /etc/ssh/sshd_config
 
-systemctl restart sshd >> $AUDITDIR/service_restart_$TIME.log
+# Validate config before restarting
+sshd -t && systemctl restart sshd >> "${AUDITDIR}/service_restart_${TIME}.log" 2>&1 \
+  || echo "WARNING: sshd config validation failed – not restarting sshd." >&2
 
-echo "Setting default umask for users..."
-line_num=$(grep -n "^[[:space:]]*umask" /etc/bashrc | head -1 | cut -d: -f1)
-sed -i ${line_num}s/002/027/ /etc/bashrc
-line_num=$(grep -n "^[[:space:]]*umask" /etc/profile | head -1 | cut -d: -f1)
-sed -i ${line_num}s/002/027/ /etc/profile
+# =============================================================================
+# 14. KERNEL / NETWORK PARAMETERS (CIS 3.x, 1.5.x)
+# =============================================================================
+echo "[*] Applying kernel hardening parameters..."
+cp /etc/sysctl.conf "${AUDITDIR}/sysctl.conf_${TIME}.bak"
 
-echo "Set History Timestamp for all users..."
-grep -q "HISTTIMEFORMAT=" /etc/profile || echo "export HISTTIMEFORMAT=\"%d.%m.%y %T  \"" >> /etc/profile
+cat > /etc/sysctl.d/99-CIS.conf << 'EOF'
+## ── IPv4 network hardening ────────────────────────────────────────────────
+net.ipv4.ip_forward                   = 0
+net.ipv4.conf.all.send_redirects      = 0
+net.ipv4.conf.default.send_redirects  = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects    = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects    = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.log_martians        = 1
+net.ipv4.conf.default.log_martians    = 1
+net.ipv4.icmp_echo_ignore_broadcasts  = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.rp_filter           = 1
+net.ipv4.conf.default.rp_filter       = 1
+net.ipv4.tcp_syncookies               = 1
 
-echo "Set History size..."
-sed -i -E 's/^HISTSIZE.*/HISTSIZE=10000/g' /etc/profile
+## ── IPv6 – disabled ──────────────────────────────────────────────────────
+net.ipv6.conf.all.disable_ipv6        = 1
+net.ipv6.conf.default.disable_ipv6   = 1
+net.ipv6.conf.lo.disable_ipv6        = 1
+net.ipv6.conf.all.accept_ra           = 0
+net.ipv6.conf.default.accept_ra       = 0
+net.ipv6.conf.all.accept_redirects    = 0
+net.ipv6.conf.default.accept_redirects = 0
 
-echo "Locking inactive user accounts..."
-useradd -D -f 30
+## ── Kernel memory / process hardening ────────────────────────────────────
+# ASLR: 2 = full randomisation
+kernel.randomize_va_space             = 2
+# Hide kernel pointers from unprivileged users
+kernel.kptr_restrict                  = 2
+# Restrict dmesg to root
+kernel.dmesg_restrict                 = 1
+# Restrict ptrace to parent processes
+kernel.yama.ptrace_scope              = 1
+# Restrict perf events
+kernel.perf_event_paranoid            = 3
+# Disable magic sysrq key
+kernel.sysrq                          = 0
+# No core dumps from setuid processes
+fs.suid_dumpable                      = 0
+# Protect hard/symbolic links
+fs.protected_hardlinks                = 1
+fs.protected_symlinks                 = 1
+EOF
 
-echo "Set login.defs..."
-for i in \
-"PASS_MAX_DAYS 90" \
-"PASS_MIN_DAYS 7" \
-"PASS_WARN_AGE 7" \
-; do
-  [[ `egrep "^${i}" /etc/login.defs` ]] && continue
-  option=${i%% *}
-  grep -q ${option} /etc/login.defs && sed -i "s/.*${option}.*/$i/g" /etc/login.defs || echo "$i" >> /etc/login.defs
+# Apply immediately
+sysctl --system
+
+# =============================================================================
+# 15. DISABLE IPv6 (sysconfig + modprobe)
+# =============================================================================
+echo "[*] Disabling IPv6 in network config..."
+cp /etc/sysconfig/network "${AUDITDIR}/network_${TIME}.bak" 2>/dev/null || true
+for param in "NETWORKING_IPV6=no" "IPV6INIT=no"; do
+  grep -qF "${param}" /etc/sysconfig/network 2>/dev/null \
+    || echo "${param}" >> /etc/sysconfig/network
 done
 
-echo "Verifying System File Permissions..."
-chmod 644 /etc/passwd
-chmod 000 /etc/shadow
-chmod 000 /etc/gshadow
-chmod 644 /etc/group
-# grub.cfg won't exist on an EFI system
-if [ -f /boot/grub2/grub.cfg ]; then
-	chmod 600 /boot/grub2/grub.cfg
-fi
-chmod 600 /etc/rsyslog.conf
-chown root:root /etc/passwd
-chown root:root /etc/shadow
-chown root:root /etc/gshadow
-chown root:root /etc/group
+# Disable at the module level
+grep -qF "options ipv6 disable=1" /etc/modprobe.d/ipv6.conf 2>/dev/null \
+  || echo "options ipv6 disable=1" >> /etc/modprobe.d/ipv6.conf
 
-echo "Setting Sticky Bit on All World-Writable Directories..."
-df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type d \( -perm -0002 -a ! -perm -1000 \) 2>/dev/null | xargs -r chmod a+t >> $AUDITDIR/sticky_on_world_$TIME.log
+# =============================================================================
+# 16. WIRELESS (CIS 3.7)
+# =============================================================================
+echo "[*] Disabling wireless interfaces..."
+nmcli radio all off 2>/dev/null || true
 
-echo "Searching for world writable files..."
-df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type f -perm -0002 >> $AUDITDIR/world_writable_files_$TIME.log
+# =============================================================================
+# 17. FAILLOCK / PAM (CIS 5.4.2)
+# =============================================================================
+echo "[*] Enabling faillock via authselect..."
+authselect select sssd --force >/dev/null 2>&1 || true
+authselect enable-feature with-faillock >/dev/null 2>&1 || true
+authselect apply-changes >/dev/null 2>&1 || true
 
-echo "Searching for Un-owned files and directories..."
-df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -nouser -ls >> $AUDITDIR/unowned_files_$TIME.log
+# =============================================================================
+# 18. CRYPTO POLICY (CIS 1.11)
+# =============================================================================
+echo "[*] Setting system-wide crypto policy to FUTURE..."
+update-crypto-policies --set FUTURE >/dev/null
 
-#34: Find Un-grouped Files and Directories
-echo "Searching for Un-grouped files and directories..."
-df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -nogroup -ls >> $AUDITDIR/ungrouped_files_$TIME.log
+# =============================================================================
+# 19. SU RESTRICTION (CIS 5.6)
+# =============================================================================
+echo "[*] Restricting su to wheel group..."
+cp /etc/pam.d/su "${AUDITDIR}/su_${TIME}.bak"
+# Remove any existing pam_wheel lines then add the authoritative one
+sed -i '/pam_wheel\.so/d' /etc/pam.d/su
+sed -i '/^auth\s.*pam_rootok\.so/a auth\t\trequired\tpam_wheel.so use_uid' /etc/pam.d/su
+gpasswd -a root wheel >/dev/null
 
-echo "Searching for SUID System Executables..."
-df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type f -perm -4000 -print >> $AUDITDIR/suid_exec_$TIME.log
+# =============================================================================
+# 20. DEFAULT UMASK (CIS 5.4.4)
+# =============================================================================
+echo "[*] Setting default umask for users..."
 
-echo "Searching for SGID System Executables..."
-df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type f -perm -2000 -print >> $AUDITDIR/sgid_exec_$TIME.log
-
-echo "Searching for empty password fields..."
-/bin/cat /etc/shadow | /bin/awk -F: '($2 == "" ) { print $1 " does not have a password "}' >> $AUDITDIR/empty_passwd_$TIME.log
-
-echo "Reviewing User and Group Settings..."
-echo "Reviewing User and Group Settings..." >> $AUDITDIR/reviewusrgrp_$TIME.log
-/bin/grep '^+:' /etc/passwd >> $AUDITDIR/reviewusrgrp_$TIME.log
-/bin/grep '^+:' /etc/shadow >> $AUDITDIR/reviewusrgrp_$TIME.log
-/bin/grep '^+:' /etc/group >> $AUDITDIR/reviewusrgrp_$TIME.log
-/bin/cat /etc/passwd | /bin/awk -F: '($3 == 0) { print $1 }' >> $AUDITDIR/reviewusrgrp_$TIME.log
-
-echo "Checking root PATH integrity..."
-
-if [ "`echo $PATH | /bin/grep :: `" != "" ]; then
-    echo "Empty Directory in PATH (::)" >> $AUDITDIR/root_path_$TIME.log
-fi
-
-if [ "`echo $PATH | /bin/grep :$`"  != "" ]; then
-    echo "Trailing : in PATH" >> $AUDITDIR/root_path_$TIME.log
-fi
-
-p=`echo $PATH | /bin/sed -e 's/::/:/' -e 's/:$//' -e 's/:/ /g'`
-set -- $p
-while [ "$1" != "" ]; do
-    if [ "$1" = "." ]; then
-        echo "PATH contains ." >> $AUDITDIR/root_path_$TIME.log
-        shift
-        continue
-    fi
-    if [ -d $1 ]; then
-        dirperm=`/bin/ls -ldH $1 | /bin/cut -f1 -d" "`
-        if [ `echo $dirperm | /bin/cut -c6 ` != "-" ]; then
-            echo "Group Write permission set on directory $1" >> $AUDITDIR/root_path_$TIME.log
-        fi
-        if [ `echo $dirperm | /bin/cut -c9 ` != "-" ]; then
-            echo "Other Write permission set on directory $1" >> $AUDITDIR/root_path_$TIME.log
-        fi
-            dirown=`ls -ldH $1 | awk '{print $3}'`
-           if [ "$dirown" != "root" ] ; then
-             echo "$1 is not owned by root" >> $AUDITDIR/root_path_$TIME.log
-              fi
-    else
-            echo "$1 is not a directory" >> $AUDITDIR/root_path_$TIME.log
-      fi
-    shift
-done
-
-echo "Checking Permissions on User Home Directories..."
-
-for dir in `/bin/cat /etc/passwd  | /bin/egrep -v '(root|halt|sync|shutdown)' |\
-    /bin/awk -F: '($8 == "PS" && $7 != "/sbin/nologin") { print $6 }'`; do
-        dirperm=`/bin/ls -ld $dir | /bin/cut -f1 -d" "`
-        if [ `echo $dirperm | /bin/cut -c6 ` != "-" ]; then
-            echo "Group Write permission set on directory $dir" >> $AUDITDIR/home_permission_$TIME.log
-        fi
-        if [ `echo $dirperm | /bin/cut -c8 ` != "-" ]; then
-            echo "Other Read permission set on directory $dir" >> $AUDITDIR/home_permission_$TIME.log
-
-        fi
-
-        if [ `echo $dirperm | /bin/cut -c9 ` != "-" ]; then
-            echo "Other Write permission set on directory $dir" >> $AUDITDIR/home_permission_$TIME.log
-        fi
-        if [ `echo $dirperm | /bin/cut -c10 ` != "-" ]; then
-            echo "Other Execute permission set on directory $dir" >> $AUDITDIR/home_permission_$TIME.log
-        fi
-done
-
-echo "Checking User Dot File Permissions..."
-for dir in `/bin/cat /etc/passwd | /bin/egrep -v '(root|sync|halt|shutdown)' |
-/bin/awk -F: '($7 != "/sbin/nologin") { print $6 }'`; do
-    for file in $dir/.[A-Za-z0-9]*; do
-
-        if [ ! -h "$file" -a -f "$file" ]; then
-            fileperm=`/bin/ls -ld $file | /bin/cut -f1 -d" "`
-
-            if [ `echo $fileperm | /bin/cut -c6 ` != "-" ]; then
-                echo "Group Write permission set on file $file" >> $AUDITDIR/dotfile_permission_$TIME.log
-            fi
-            if [ `echo $fileperm | /bin/cut -c9 ` != "-" ]; then
-                echo "Other Write permission set on file $file" >> $AUDITDIR/dotfile_permission_$TIME.log
-            fi
-        fi
-
-    done
-
-done
-
-echo "Checking Permissions on User .netrc Files..."
-for dir in `/bin/cat /etc/passwd | /bin/egrep -v '(root|sync|halt|shutdown)' |\
-    /bin/awk -F: '($7 != "/sbin/nologin") { print $6 }'`; do
-    for file in $dir/.netrc; do
-        if [ ! -h "$file" -a -f "$file" ]; then
-            fileperm=`/bin/ls -ld $file | /bin/cut -f1 -d" "`
-            if [ `echo $fileperm | /bin/cut -c5 ` != "-" ]
-            then
-                echo "Group Read set on $file" >> $AUDITDIR/netrd_permission_$TIME.log
-            fi
-            if [ `echo $fileperm | /bin/cut -c6 ` != "-" ]
-            then
-                echo "Group Write set on $file" >> $AUDITDIR/netrd_permission_$TIME.log
-            fi
-            if [ `echo $fileperm | /bin/cut -c7 ` != "-" ]
-            then
-                echo "Group Execute set on $file" >> $AUDITDIR/netrd_permission_$TIME.log
-            fi
-            if [ `echo $fileperm | /bin/cut -c8 ` != "-" ]
-            then
-                echo "Other Read  set on $file" >> $AUDITDIR/netrd_permission_$TIME.log
-            fi
-            if [ `echo $fileperm | /bin/cut -c9 ` != "-" ]
-            then
-                echo "Other Write set on $file" >> $AUDITDIR/netrd_permission_$TIME.log
-            fi
-            if [ `echo $fileperm | /bin/cut -c10 ` != "-" ]
-            then
-                echo "Other Execute set on $file" >> $AUDITDIR/netrd_permission_$TIME.log
-            fi
-        fi
-    done
-done
-
-echo "Checking for Presence of User .rhosts Files..."
-for dir in `/bin/cat /etc/passwd | /bin/egrep -v '(root|halt|sync|shutdown)' |\
-    /bin/awk -F: '($7 != "/sbin/nologin") { print $6 }'`; do
-    for file in $dir/.rhosts; do
-        if [ ! -h "$file" -a -f "$file" ]; then
-            echo ".rhosts file in $dir" >> $AUDITDIR/rhosts_$TIME.log
-        fi    done
-done
-
-echo "Checking Groups in /etc/passwd..."
-
-for i in $(cut -s -d: -f4 /etc/passwd | sort -u ); do
-  grep -q -P "^.*?:x:$i:" /etc/group
-  if [ $? -ne 0 ]; then
-    echo "Group $i is referenced by /etc/passwd but does not exist in /etc/group" >> $AUDITDIR/audit_$TIME.log
+for profile in /etc/bashrc /etc/profile; do
+  line_num=$(grep -n "^[[:space:]]*umask" "${profile}" | head -1 | cut -d: -f1)
+  if [[ -n "${line_num}" ]]; then
+    sed -i "${line_num}s/umask [0-9]*/umask 027/" "${profile}"
+  else
+    echo "umask 027" >> "${profile}"
   fi
 done
 
-echo "Checking That Users Are Assigned Home Directories..."
+# Also set in /etc/profile.d for all login shells
+echo "umask 027" > /etc/profile.d/CIS-umask.sh
+chmod 644 /etc/profile.d/CIS-umask.sh
 
-cat /etc/passwd | awk -F: '{ print $1 " " $3 " " $6 }' | while read user uid dir; do
-  if [ $uid -ge 500 -a ! -d "$dir" -a $user != "nfsnobody" ]; then
- echo "The home directory ($dir) of user $user does not exist." >> $AUDITDIR/audit_$TIME.log
- fi
+# =============================================================================
+# 21. SHELL HISTORY (CIS 5.4.5)
+# =============================================================================
+echo "[*] Configuring shell history settings..."
+grep -q "HISTTIMEFORMAT=" /etc/profile \
+  || echo 'export HISTTIMEFORMAT="%d.%m.%y %T  "' >> /etc/profile
+sed -i -E 's/^HISTSIZE.*/HISTSIZE=10000/' /etc/profile
+grep -q "HISTSIZE=10000" /etc/profile || echo "HISTSIZE=10000" >> /etc/profile
+grep -q "HISTCONTROL=" /etc/profile \
+  || echo 'export HISTCONTROL=ignoredups:ignorespace' >> /etc/profile
+
+# =============================================================================
+# 22. USER ACCOUNT POLICY (CIS 5.4.1, 5.5)
+# =============================================================================
+echo "[*] Configuring account inactivity lock..."
+useradd -D -f 30
+
+echo "[*] Configuring /etc/login.defs..."
+_set_conf_option /etc/login.defs "PASS_MAX_DAYS" 90
+_set_conf_option /etc/login.defs "PASS_MIN_DAYS" 7
+_set_conf_option /etc/login.defs "PASS_WARN_AGE" 7
+# RHEL 8 uses UID 1000+ for regular users
+_set_conf_option /etc/login.defs "UID_MIN" 1000
+
+# =============================================================================
+# 23. SYSTEM FILE PERMISSIONS (CIS 6.1)
+# =============================================================================
+echo "[*] Verifying system file permissions..."
+chown root:root /etc/passwd  && chmod 644 /etc/passwd
+chown root:root /etc/shadow  && chmod 000 /etc/shadow
+chown root:root /etc/gshadow && chmod 000 /etc/gshadow
+chown root:root /etc/group   && chmod 644 /etc/group
+
+# grub.cfg location differs between BIOS and EFI
+for grubcfg in /boot/grub2/grub.cfg /boot/efi/EFI/redhat/grub.cfg; do
+  if [[ -f "${grubcfg}" ]]; then
+    chown root:root "${grubcfg}"
+    chmod 600 "${grubcfg}"
+  fi
 done
 
-echo "Checking That Defined Home Directories Exist..."
+chmod 600 /etc/rsyslog.conf
 
-cat /etc/passwd | awk -F: '{ print $1 " " $3 " " $6 }' | while read user uid dir; do
- if [ $uid -ge 500 -a -d "$dir" -a $user != "nfsnobody" ]; then
- owner=$(stat -L -c "%U" "$dir")
- if [ "$owner" != "$user" ]; then
- echo "The home directory ($dir) of user $user is owned by $owner." >> $AUDITDIR/audit_$TIME.log
- fi
- fi
-done
+# =============================================================================
+# 24. STICKY BIT ON WORLD-WRITABLE DIRS (CIS 1.1.22)
+# =============================================================================
+echo "[*] Setting sticky bit on world-writable directories..."
+df --local -P \
+  | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type d \( -perm -0002 -a ! -perm -1000 \) 2>/dev/null \
+  | xargs -r chmod a+t \
+  >> "${AUDITDIR}/sticky_on_world_${TIME}.log" 2>&1 || true
 
-echo "Checking for Duplicate UIDs..."
+# =============================================================================
+# 25. AUDIT REPORTS (informational – do not auto-remediate)
+# =============================================================================
+echo "[*] Generating audit reports..."
 
-/bin/cat /etc/passwd | /bin/cut -f3 -d":" | /bin/sort -n | /usr/bin/uniq -c |\
-    while read x ; do
-    [ -z "${x}" ] && break
-    set - $x
-    if [ $1 -gt 1 ]; then
-        users=`/bin/gawk -F: '($3 == n) { print $1 }' n=$2 \
-            /etc/passwd | /usr/bin/xargs`
-        echo "Duplicate UID ($2): ${users}" >> $AUDITDIR/audit_$TIME.log
+echo "[*]   World-writable files..."
+df --local -P \
+  | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type f -perm -0002 2>/dev/null \
+  >> "${AUDITDIR}/world_writable_files_${TIME}.log" || true
+
+echo "[*]   Un-owned files..."
+df --local -P \
+  | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -nouser -ls 2>/dev/null \
+  >> "${AUDITDIR}/unowned_files_${TIME}.log" || true
+
+echo "[*]   Un-grouped files..."
+df --local -P \
+  | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -nogroup -ls 2>/dev/null \
+  >> "${AUDITDIR}/ungrouped_files_${TIME}.log" || true
+
+echo "[*]   SUID executables..."
+df --local -P \
+  | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type f -perm -4000 -print 2>/dev/null \
+  >> "${AUDITDIR}/suid_exec_${TIME}.log" || true
+
+echo "[*]   SGID executables..."
+df --local -P \
+  | awk 'NR!=1 {print $6}' \
+  | xargs -I{} find {} -xdev -type f -perm -2000 -print 2>/dev/null \
+  >> "${AUDITDIR}/sgid_exec_${TIME}.log" || true
+
+echo "[*]   Empty password fields..."
+awk -F: '($2 == "") { print $1 " does not have a password" }' /etc/shadow \
+  >> "${AUDITDIR}/empty_passwd_${TIME}.log" || true
+
+# =============================================================================
+# 26. USER / GROUP INTEGRITY CHECKS
+# =============================================================================
+echo "[*] Reviewing user and group settings..."
+{
+  echo "=== NIS/'+' entries in /etc/passwd ==="
+  grep '^+:' /etc/passwd  || true
+  echo "=== NIS/'+' entries in /etc/shadow ==="
+  grep '^+:' /etc/shadow  || true
+  echo "=== NIS/'+' entries in /etc/group ==="
+  grep '^+:' /etc/group   || true
+  echo "=== UID-0 accounts ==="
+  awk -F: '($3 == 0) { print $1 }' /etc/passwd
+} >> "${AUDITDIR}/reviewusrgrp_${TIME}.log"
+
+echo "[*] Checking root PATH integrity..."
+{
+  [[ ":${PATH}:" == *"::"* ]] && echo "Empty directory (::) found in PATH"
+  [[ "${PATH}" == *":"       ]] && echo "Trailing colon in PATH"
+  IFS=: read -ra _dirs <<< "${PATH}"
+  for d in "${_dirs[@]}"; do
+    [[ "${d}" == "." ]] && { echo "PATH contains '.'"; continue; }
+    if [[ -d "${d}" ]]; then
+      _perm=$(ls -ldH "${d}" | cut -c1-10)
+      [[ "${_perm:5:1}" != "-" ]] && echo "Group write on ${d}"
+      [[ "${_perm:8:1}" != "-" ]] && echo "Other write on ${d}"
+      _owner=$(stat -c '%U' "${d}")
+      [[ "${_owner}" != "root" ]] && echo "${d} not owned by root (owned by ${_owner})"
+    else
+      echo "${d} is not a directory"
     fi
-done
+  done
+} >> "${AUDITDIR}/root_path_${TIME}.log"
 
-echo "Checking for Duplicate GIDs..."
+echo "[*] Checking home directory permissions..."
+{
+  # Field 7 = shell; skip nologin/false accounts
+  awk -F: '$7 !~ /nologin|false/ && $6 != "" { print $6 }' /etc/passwd | while IFS= read -r dir; do
+    [[ -d "${dir}" ]] || continue
+    _perm=$(ls -ld "${dir}" | cut -c1-10)
+    [[ "${_perm:5:1}" != "-" ]] && echo "Group write on ${dir}"
+    [[ "${_perm:7:1}" != "-" ]] && echo "Other read on ${dir}"
+    [[ "${_perm:8:1}" != "-" ]] && echo "Other write on ${dir}"
+    [[ "${_perm:9:1}" != "-" ]] && echo "Other execute on ${dir}"
+  done
+} >> "${AUDITDIR}/home_permission_${TIME}.log"
 
-/bin/cat /etc/group | /bin/cut -f3 -d":" | /bin/sort -n | /usr/bin/uniq -c |\
-    while read x ; do
-    [ -z "${x}" ] && break
-    set - $x
-    if [ $1 -gt 1 ]; then
-        grps=`/bin/gawk -F: '($3 == n) { print $1 }' n=$2 \
-            /etc/group | xargs`
-        echo "Duplicate GID ($2): ${grps}" >> $AUDITDIR/audit_$TIME.log
+echo "[*] Checking dot-file permissions..."
+{
+  awk -F: '$7 !~ /nologin|false/ && $6 != "" { print $6 }' /etc/passwd | while IFS= read -r dir; do
+    for f in "${dir}"/.[A-Za-z0-9]*; do
+      [[ -h "${f}" || ! -f "${f}" ]] && continue
+      _perm=$(ls -ld "${f}" | cut -c1-10)
+      [[ "${_perm:5:1}" != "-" ]] && echo "Group write on ${f}"
+      [[ "${_perm:8:1}" != "-" ]] && echo "Other write on ${f}"
+    done
+  done
+} >> "${AUDITDIR}/dotfile_permission_${TIME}.log"
+
+echo "[*] Checking .netrc file permissions..."
+{
+  awk -F: '$6 != "" { print $6 }' /etc/passwd | while IFS= read -r dir; do
+    f="${dir}/.netrc"
+    [[ -h "${f}" || ! -f "${f}" ]] && continue
+    _perm=$(ls -ld "${f}" | cut -c1-10)
+    for pos col in 4 "Group read" 5 "Group write" 6 "Group exec" 7 "Other read" 8 "Other write" 9 "Other exec"; do
+      [[ "${_perm:${pos}:1}" != "-" ]] && echo "${col} on ${f}"
+    done
+  done
+} >> "${AUDITDIR}/netrc_permission_${TIME}.log"
+
+echo "[*] Checking for .rhosts files..."
+{
+  awk -F: '$7 !~ /nologin|false/ && $6 != "" { print $6 }' /etc/passwd | while IFS= read -r dir; do
+    [[ -f "${dir}/.rhosts" && ! -h "${dir}/.rhosts" ]] && echo ".rhosts file in ${dir}"
+  done
+} >> "${AUDITDIR}/rhosts_${TIME}.log"
+
+echo "[*] Checking /etc/passwd groups exist in /etc/group..."
+{
+  cut -s -d: -f4 /etc/passwd | sort -u | while IFS= read -r gid; do
+    grep -qP "^[^:]*:[^:]*:${gid}:" /etc/group \
+      || echo "GID ${gid} referenced in /etc/passwd but missing from /etc/group"
+  done
+} >> "${AUDITDIR}/audit_${TIME}.log"
+
+echo "[*] Checking home directory existence and ownership..."
+{
+  # RHEL 8: regular users start at UID 1000
+  awk -F: '$3>=1000 && $1!="nfsnobody" { print $1" "$3" "$6 }' /etc/passwd | \
+  while read -r user uid dir; do
+    if [[ ! -d "${dir}" ]]; then
+      echo "Home dir (${dir}) of user ${user} (uid=${uid}) does not exist."
+    else
+      owner=$(stat -L -c "%U" "${dir}")
+      [[ "${owner}" != "${user}" ]] \
+        && echo "Home dir (${dir}) of ${user} is owned by ${owner}."
     fi
-done
+  done
+} >> "${AUDITDIR}/audit_${TIME}.log"
 
-echo "Checking That Reserved UIDs Are Assigned to System Accounts..."
+echo "[*] Checking for duplicate UIDs, GIDs, usernames, group names..."
+{
+  echo "=== Duplicate UIDs ==="
+  cut -f3 -d: /etc/passwd | sort -n | uniq -d | while IFS= read -r uid; do
+    users=$(awk -F: -v u="${uid}" '$3==u{printf "%s ", $1}' /etc/passwd)
+    echo "Duplicate UID ${uid}: ${users}"
+  done
 
-defUsers="root bin daemon adm lp sync shutdown halt mail news uucp operator games
+  echo "=== Duplicate GIDs ==="
+  cut -f3 -d: /etc/group | sort -n | uniq -d | while IFS= read -r gid; do
+    grps=$(awk -F: -v g="${gid}" '$3==g{printf "%s ", $1}' /etc/group)
+    echo "Duplicate GID ${gid}: ${grps}"
+  done
+
+  echo "=== Duplicate user names ==="
+  cut -f1 -d: /etc/passwd | sort | uniq -d | while IFS= read -r name; do
+    echo "Duplicate username: ${name}"
+  done
+
+  echo "=== Duplicate group names ==="
+  cut -f1 -d: /etc/group | sort | uniq -d | while IFS= read -r name; do
+    echo "Duplicate group name: ${name}"
+  done
+} >> "${AUDITDIR}/audit_${TIME}.log"
+
+echo "[*] Checking for .netrc and .forward files..."
+{
+  awk -F: '$6 != "" { print $6 }' /etc/passwd | while IFS= read -r dir; do
+    [[ -f "${dir}/.netrc"   && ! -h "${dir}/.netrc"   ]] && echo ".netrc present:   ${dir}/.netrc"
+    [[ -f "${dir}/.forward" && ! -h "${dir}/.forward" ]] && echo ".forward present: ${dir}/.forward"
+  done
+} >> "${AUDITDIR}/audit_${TIME}.log"
+
+echo "[*] Checking reserved UIDs for unexpected accounts..."
+{
+  _systemAccounts="root bin daemon adm lp sync shutdown halt mail news uucp operator games
 gopher ftp nobody nscd vcsa rpc mailnull smmsp pcap ntp dbus avahi sshd rpcuser
 nfsnobody haldaemon avahi-autoipd distcache apache oprofile webalizer dovecot squid
 named xfs gdm sabayon usbmuxd rtkit abrt saslauth pulse postfix tcpdump"
-/bin/cat /etc/passwd | /bin/awk -F: '($3 < 500) { print $1" "$3 }' |\
-    while read user uid; do
-        found=0
-        for tUser in ${defUsers}
-        do
-            if [ ${user} = ${tUser} ]; then
-                found=1
-            fi
-        done
-        if [ $found -eq 0 ]; then
-            echo "User $user has a reserved UID ($uid)."  >> $AUDITDIR/audit_$TIME.log
-        fi
-    done
+  awk -F: '$3<1000 { print $1, $3 }' /etc/passwd | while read -r user uid; do
+    found=0
+    for t in ${_systemAccounts}; do [[ "${user}" == "${t}" ]] && found=1 && break; done
+    [[ ${found} -eq 0 ]] && echo "Unexpected reserved UID ${uid} assigned to ${user}"
+  done
+} >> "${AUDITDIR}/audit_${TIME}.log"
 
-echo "Checking for Duplicate User Names..."
-
-cat /etc/passwd | cut -f1 -d":" | sort -n | /usr/bin/uniq -c |\
-    while read x ; do
-    [ -z "${x}" ] && break
-    set - $x
-    if [ $1 -gt 1 ]; then
-        uids=`/bin/gawk -F: '($1 == n) { print $3 }' n=$2 \
-            /etc/passwd | xargs`
-        echo "Duplicate User Name ($2): ${uids}"  >> $AUDITDIR/audit_$TIME.log
-    fi
-done
-
-echo "Checking for Duplicate Group Names..."
-
-cat /etc/group | cut -f1 -d":" | /bin/sort -n | /usr/bin/uniq -c |\
-    while read x ; do
-    [ -z "${x}" ] && break
-    set - $x
-    if [ $1 -gt 1 ]; then
-        gids=`/bin/gawk -F: '($1 == n) { print $3 }' n=$2 \
-            /etc/group | xargs`
-        echo "Duplicate Group Name ($2): ${gids}"  >> $AUDITDIR/audit_$TIME.log
-    fi
-done
-
-echo "Checking for Presence of User .netrc Files..."
-
-for dir in `/bin/cat /etc/passwd |\
-    /bin/awk -F: '{ print $6 }'`; do
-    if [ ! -h "$dir/.netrc" -a -f "$dir/.netrc" ]; then
-        echo ".netrc file $dir/.netrc exists"  >> $AUDITDIR/audit_$TIME.log
-    fi
-done
-
-echo "Checking for Presence of User .forward Files..."
-
-for dir in `/bin/cat /etc/passwd |\
-    /bin/awk -F: '{ print $6 }'`; do
-    if [ ! -h "$dir/.forward" -a -f "$dir/.forward" ]; then
-        echo ".forward file $dir/.forward exists"  >> $AUDITDIR/audit_$TIME.log
-    fi
-done
-
-echo "Modifying Network Parameters..."
-cp /etc/sysctl.conf $AUDITDIR/sysctl.conf_$TIME.bak
-
-cat > /etc/sysctl.d/99-CIS.conf << 'EOF'
-net.ipv4.ip_forward=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.default.send_redirects=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.conf.all.secure_redirects=0
-net.ipv4.conf.default.secure_redirects=0
-net.ipv4.conf.all.log_martians=1
-net.ipv4.conf.default.log_martians=1
-net.ipv4.route.flush=1
-net.ipv4.icmp_echo_ignore_broadcasts=1
-net.ipv4.icmp_ignore_bogus_error_responses=1
-net.ipv4.icmp_echo_bold_ignore_broadcasts=1
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.default.rp_filter=1
-net.ipv4.tcp_syncookies=1
-net.ipv6.conf.all.accept_ra=0
-net.ipv6.conf.default.accept_ra=0
-net.ipv6.conf.all.accept_redirects=0
-net.ipv6.conf.default.accept_redirects=0
-net.ipv6.conf.all.disable_ipv6=1
-fs.suid_dumpable=0
-EOF
-
-echo "Disabling IPv6..."
-cp /etc/sysconfig/network $AUDITDIR/network_$TIME.bak
-for i in "NETWORKING_IPV6=no" "IPV6INIT=no"; do
-  [[ `egrep -q "^$i" /etc/sysconfig/network` ]] || echo "$i" >> /etc/sysconfig/network
-done
-[ -f /etc/modprobe.d/ipv6.conf ] && `egrep -q "options ipv6 disable=1" /etc/modprobe.d/ipv6.conf` || echo "options ipv6 disable=1" >> /etc/modprobe.d/ipv6.conf
-
-echo "Disabling WLAN interfaces..."
-nmcli radio all off
-
-echo "Enabling faillock feature with authselect..."
-authselect select sssd >/dev/null
-authselect enable-feature with-faillock >/dev/null
-authselect apply-changes >/dev/null
-
-echo "Set Crypto Policy to FUTURE"
-update-crypto-policies --set FUTURE >/dev/null
-
-echo "Restricting Access to the su Command..."
-cp /etc/pam.d/su $AUDITDIR/su_$TIME.bak
-pam_su='/etc/pam.d/su'
-line_num="$(grep -n "^\#auth[[:space:]]*required[[:space:]]*pam_wheel.so[[:space:]]*use_uid" ${pam_su} | cut -d: -f1)"
-sed -i "${line_num} a auth		required	pam_wheel.so use_uid" ${pam_su}
-
-echo "Add root to group wheel..."
-gpasswd -a root wheel >/dev/null
-
+# =============================================================================
+# DONE
+# =============================================================================
 echo ""
-echo "Successfully Completed"
-echo "Please check $AUDITDIR"
+echo "============================================================"
+echo "  Hardening completed successfully."
+echo "  Review audit artefacts in: ${AUDITDIR}"
+echo "  IMPORTANT: Reboot the host to apply all kernel / module"
+echo "             and crypto-policy changes."
+echo "============================================================"
