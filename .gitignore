@@ -1,0 +1,20 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Shell editor temp
+*~
+\#*\#
+.\#*
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
